@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MiSTer · Network Viewer</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#10151c;color:#e6edf5}
+body{max-width:1100px;margin:0 auto;padding:24px}header{display:flex;align-items:center;justify-content:space-between;gap:20px}
+h1{font-size:24px;margin:0}header p{color:#93a5b9;font-size:14px;margin:6px 0 20px}.badge{color:#7ee0b7;font-size:13px}
+.screen{background:#050608;border:1px solid #273240;border-radius:12px;display:flex;justify-content:center;align-items:center;overflow:hidden;min-height:220px}
+canvas{display:block;width:min(100%,880px);height:auto;aspect-ratio:4/3;image-rendering:pixelated;max-height:calc(100vh - 230px);object-fit:fill}
+.screen:fullscreen canvas{width:auto;height:100vh;max-width:100vw;max-height:100vh}
+.controls{display:flex;align-items:center;flex-wrap:wrap;gap:14px;margin:18px 0}button,select{font:inherit;background:#1c2735;color:#e6edf5;border:1px solid #34465b;border-radius:7px;padding:8px 12px}
+button{cursor:pointer}label{font-size:14px;color:#aebccd;display:flex;align-items:center;gap:8px}.stats{display:flex;flex-wrap:wrap;gap:24px;color:#93a5b9;font-size:14px}.stats strong{color:#e6edf5;font-variant-numeric:tabular-nums}
+#message{min-height:22px;color:#aebccd;font-size:14px}footer{font-size:12px;color:#708299;margin-top:16px}.bad{color:#ffb3aa}
+</style>
+<header><div><h1>MiSTer <span style="color:#7b94b0;font-weight:400">/ Viewer</span></h1><p>Core video · Direct LAN</p></div><span class="badge" id="state">Connecting…</span></header>
+<div class="screen" id="screen"><canvas id="video" width="256" height="224" aria-label="MiSTer game video"></canvas></div>
+<div class="controls"><button id="pause">Pause</button><label>Frame rate <select id="rate"><option value="5">5 fps</option><option value="15">15 fps</option><option value="30">30 fps</option><option value="60" selected>60 fps</option></select></label><label>Video format <select id="format"><option value="jpeg90" selected>JPEG · quality 90</option><option value="jpeg85">JPEG · quality 85</option><option value="jpegfast">JPEG · faster</option><option value="raw">Uncompressed</option></select></label><label>Interlacing <select id="deinterlace"><option value="both" selected>Both fields</option><option value="fixed">One field</option></select></label><label>Aspect ratio <select id="aspect"><option value="4/3">4:3</option><option value="native">Native pixels</option></select></label><button id="fullscreen">Fullscreen</button></div>
+<div class="stats"><span>Displayed: <strong id="fps">—</strong></span><span>Frame: <strong id="size">—</strong></span><span>Frame size: <strong id="bytes">—</strong></span><span>Bitrate: <strong id="traffic">—</strong></span><span>Capture: <strong id="capture">—</strong></span><span>Encoding: <strong id="encode">—</strong></span><span>Rendering: <strong id="request">—</strong></span></div>
+<p id="message">Waiting for the first frame…</p><footer>JPEG uses lossy compression; “JPEG · faster” reduces color detail. Bob expands each field separately. “Both fields” preserves more motion samples, but actual FPS depends on streaming performance. No audio or recording.</footer>
+<script>
+const $=id=>document.getElementById(id),canvas=$('video'),ctx=canvas.getContext('2d',{alpha:false});
+let paused=false,image=null,shown=0,receivedBytes=0,windowStart=performance.now();
+let controller=null,generation=0,lastSource=null,lastDraw=0;
+function aspect(){canvas.style.aspectRatio=$('aspect').value==='native'?`${canvas.width}/${canvas.height}`:'4/3'}
+function restart(){generation++;if(controller)controller.abort();shown=0;receivedBytes=0;windowStart=performance.now();lastSource=null}
+function error(message){$('state').textContent='No video';$('state').className='badge bad';$('message').textContent=message}
+$('aspect').onchange=aspect;
+for(const id of ['format','rate','deinterlace'])$(id).onchange=restart;
+$('pause').onclick=()=>{paused=!paused;restart();$('pause').textContent=paused?'Resume':'Pause';$('state').textContent=paused?'Paused':'Connecting…';if(paused){$('fps').textContent='0 fps';$('traffic').textContent='0 Mbps'}};
+document.addEventListener('visibilitychange',restart);
+$('fullscreen').onclick=()=>{if(!document.fullscreenElement)$('screen').requestFullscreen();else document.exitFullscreen()};
+document.addEventListener('fullscreenchange',()=>{canvas.style.maxHeight=document.fullscreenElement?'100vh':'calc(100vh - 230px)'});
+setInterval(()=>{const now=performance.now(),elapsed=now-windowStart;if(elapsed>=1000){$('fps').textContent=`${(shown*1000/elapsed).toFixed(1)} fps`;$('traffic').textContent=`${(receivedBytes*8/(elapsed*1000)).toFixed(1)} Mbps`;shown=0;receivedBytes=0;windowStart=now}},250);
+async function display(data,headers,raw,token){
+ const started=performance.now(),w=Number(headers['X-Width']),h=Number(headers['X-Height']);
+ const displayH=Number(headers['X-Display-Height']||h),mode=headers['X-Video-Mode'];
+ if(!Number.isInteger(w)||!Number.isInteger(h)||w<1||h<1||w>2048||h>1024||!Number.isInteger(displayH)||displayH<h||displayH>1024)throw new Error('Invalid frame dimensions');
+ receivedBytes+=data.length;
+ const source=`${w}:${h}:${mode}:${headers['X-Frame-Counter']}:${headers['X-Field']}`;
+ // Do not count repeated deliveries of the same source field as extra FPS.
+ if(source===lastSource && started-lastDraw<100)return;
+ let bitmap=null;
+ try{
+  if(raw){if(data.length!==w*h*3)throw new Error('Incomplete frame')}
+  else{bitmap=await createImageBitmap(new Blob([data],{type:'image/jpeg'}));if(bitmap.width!==w||bitmap.height!==h)throw new Error('Invalid JPEG dimensions')}
+  if(token!==generation||paused||document.hidden)return;
+  if(w!==canvas.width||displayH!==canvas.height){canvas.width=w;canvas.height=displayH;image=null;aspect()}
+  if(bitmap){
+   ctx.imageSmoothingEnabled=false;
+   const shift=mode==='bob-both-fields' && headers['X-Field']==='1'?1:0;
+   if(shift)ctx.drawImage(bitmap,0,0,w,1,0,0,w,1);
+   ctx.drawImage(bitmap,0,shift,w,displayH);
+  }else{
+   if(!image)image=ctx.createImageData(w,h);
+   for(let s=0,d=0;s<data.length;s+=3,d+=4){image.data[d]=data[s];image.data[d+1]=data[s+1];image.data[d+2]=data[s+2];image.data[d+3]=255}
+   ctx.putImageData(image,0,0);
+  }
+  shown++;lastSource=source;lastDraw=performance.now();
+  $('state').textContent='● Live';$('state').className='badge';
+  $('size').textContent=`${w} × ${displayH}${mode==='bob-both-fields'?' · bob · both fields':mode==='bob-fixed-field'?' · bob · one field':''}`;
+  $('capture').textContent=`${Number(headers['X-Capture-Ms']).toFixed(1)} ms`;
+  $('encode').textContent=raw?'—':`${Number(headers['X-Encode-Ms']).toFixed(1)} ms`;
+  $('request').textContent=`${(performance.now()-started).toFixed(1)} ms`;
+  $('bytes').textContent=`${(data.length/1000).toFixed(1)} KB`;
+  $('message').textContent='';
+ }finally{if(bitmap)bitmap.close()}
+}
+async function stream(response,token){
+ const reader=response.body.getReader();let pending=new Uint8Array(0),offset=0;
+ async function exact(n){
+  const result=new Uint8Array(n);let written=0;
+  while(written<n){
+   if(offset===pending.length){
+    let timer=setTimeout(()=>controller?.abort(),5000),chunk;
+    try{chunk=await reader.read()}finally{clearTimeout(timer)}
+    if(chunk.done)throw new Error('Stream ended');pending=chunk.value;offset=0;
+   }
+   const count=Math.min(n-written,pending.length-offset);
+   result.set(pending.subarray(offset,offset+count),written);written+=count;offset+=count;
+  }
+  return result;
+ }
+ try{
+  while(token===generation&&!paused&&!document.hidden){
+   const prefix=await exact(4),length=new DataView(prefix.buffer).getUint32(0);
+   if(length<2||length>4096)throw new Error('Invalid stream header');
+   const headers=JSON.parse(new TextDecoder().decode(await exact(length)));
+   const bytes=Number(headers['Content-Length']);
+   if(!Number.isInteger(bytes)||bytes<0||bytes>7*1024*1024)throw new Error('Invalid packet size');
+   const data=await exact(bytes);
+   if(headers.error){error(headers.error);continue}
+   await display(data,headers,false,token);
+  }
+ }finally{await reader.cancel().catch(()=>{});reader.releaseLock()}
+}
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function run(){
+ while(true){
+  if(paused||document.hidden){await sleep(100);continue}
+  const token=generation,format=$('format').value,fps=Number($('rate').value),deinterlace=$('deinterlace').value,t=performance.now();
+  controller=new AbortController();let timeout=setTimeout(()=>controller.abort(),5000);
+  try{
+   if(format==='raw'){
+    const response=await fetch(`/frame.bin?deinterlace=${deinterlace}`,{cache:'no-store',signal:controller.signal});
+    if(!response.ok)throw new Error(await response.text());
+    const headers={};for(const name of ['Width','Height','Display-Height','Video-Mode','Frame-Counter','Field','Capture-Ms','Encode-Ms'])headers['X-'+name]=response.headers.get('X-'+name);
+    const data=new Uint8Array(await response.arrayBuffer());clearTimeout(timeout);
+    await display(data,headers,true,token);
+    await sleep(Math.max(1,1000/fps-(performance.now()-t)));
+   }else{
+    const quality=format==='jpeg90'?90:85,chroma=format==='jpegfast'?'420':'444';
+    const response=await fetch(`/stream?quality=${quality}&chroma=${chroma}&deinterlace=${deinterlace}&fps=${fps}`,{cache:'no-store',signal:controller.signal});
+    clearTimeout(timeout);if(!response.ok)throw new Error(await response.text());
+    await stream(response,token);
+   }
+  }catch(e){if(token===generation&&!paused&&!document.hidden){error(`${e.message}. Reconnecting…`);await sleep(500)}}
+  finally{clearTimeout(timeout);controller.abort();controller=null}
+ }
+}
+run();
+</script></html>
